@@ -199,6 +199,24 @@ def compute_kpis(df: pd.DataFrame) -> dict:
         "with_dependencies": int(with_dependencies),
     }
 
+# Excel writer fallback: try openpyxl, then XlsxWriter
+
+def make_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    engine = None
+    try:
+        import openpyxl  # type: ignore
+        engine = "openpyxl"
+    except Exception:
+        try:
+            import xlsxwriter  # type: ignore
+            engine = "xlsxwriter"
+        except Exception:
+            raise RuntimeError("No Excel writer available. Install either 'openpyxl' or 'XlsxWriter'.")
+    with pd.ExcelWriter(buf, engine=engine) as writer:
+        df.to_excel(writer, sheet_name="Findings", index=False)
+    return buf.getvalue()
+
 # ---------------------------
 # Header / Controls row
 # ---------------------------
@@ -248,11 +266,18 @@ with right:
             export_df = st.session_state.get("export_df", st.session_state["findings_df"]).copy()
             df_to_export = export_df.drop(columns=[c for c in ["_HasDeps", "_LicList"] if c in export_df.columns])
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df_to_export.to_excel(writer, sheet_name="Findings", index=False)
+            try:
+            data_bytes = make_excel_bytes(df_to_export)
             st.download_button(
                 label="📥 Export to Excel",
-                data=buf.getvalue(),
+                data=data_bytes,
+                file_name=f"oss_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Download the current (filtered) table as Excel",
+            )
+        except RuntimeError as e:
+            st.error(str(e))
+            st.button("📥 Export to Excel", disabled=True),
                 file_name=f"oss_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 help="Download the current (filtered) table as Excel",
