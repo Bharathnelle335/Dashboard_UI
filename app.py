@@ -1,7 +1,8 @@
-# streamlit_app.py
-# Full Streamlit dashboard with Excel-like in-column filters (AG Grid),
-# ScanOSS JSON/YAML parsing, KPI cards, license pie chart (Altair),
-# and filtered Excel export.
+# app.py
+# OSS Compliance – ScanOSS Dashboard (Streamlit)
+# - Upload JSON/YAML -> Scan/Process -> Stable table with in-column filters -> Export XLSX
+# - Altair license pie chart
+# - AG Grid filters with Excel-like funnel icon (falls back to basic table if not installed)
 
 import io
 import json
@@ -11,7 +12,11 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# Optional dependencies
+# Optional: raise upload/message size (MB). Comment out if you handle in .streamlit/config.toml
+# st.set_option("server.maxUploadSize", 2048)
+# st.set_option("server.maxMessageSize", 2048)
+
+# Optional deps
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
     _HAS_AGGRID = True
@@ -24,25 +29,19 @@ try:
 except Exception:
     _HAS_YAML = False
 
-# ---------------------------
-# Page config
-# ---------------------------
-# Toggle this to True only if you have AG Grid Enterprise available
+# Toggle Set Filter (AG Grid Enterprise only). Keep False for Community version.
 USE_SET_FILTER = False
-# ---------------------------
-st.set_page_config(
-    page_title="OSS Compliance – JSON/YAML Dashboard",
-    layout="wide",
-)
+
+st.set_page_config(page_title="OSS Compliance – JSON/YAML Dashboard", layout="wide")
 
 # ---------------------------
-# Session state init
+# Session state
 # ---------------------------
 DEFAULT_STATE = {
     "uploaded_file": None,
     "file_name": "",
-    "uploaded": False,       # file is chosen
-    "processed": False,      # after clicking Scan / Process
+    "uploaded": False,        # file is chosen
+    "processed": False,       # after clicking Scan / Process
     "kpis": {
         "files_scanned": 0,
         "components_total": 0,
@@ -50,19 +49,14 @@ DEFAULT_STATE = {
         "vulnerabilities": 0,
         "with_dependencies": 0,
     },
-    "findings_df": pd.DataFrame(),
-    "export_df": pd.DataFrame(),
-    "table_df": pd.DataFrame(),
+    "findings_df": pd.DataFrame(),  # full parsed (with helper cols)
+    "table_df": pd.DataFrame(),     # frozen display table (no helper cols)
+    "export_df": pd.DataFrame(),    # current export view
 }
 
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
-# ---------------------------
-# Helpers
-# ---------------------------
-SEVERITY_ORDER = {"critical": 5, "high": 4, "moderate": 3, "medium": 3, "low": 2, "none": 1, None: 0}
 
 
 def reset_state():
@@ -70,6 +64,11 @@ def reset_state():
         st.session_state[k] = v
 
 
+SEVERITY_ORDER = {"critical": 5, "high": 4, "moderate": 3, "medium": 3, "low": 2, "none": 1, None: 0}
+
+# ---------------------------
+# Data loading & parsing
+# ---------------------------
 def _load_structured(file) -> dict:
     """Load JSON or YAML into a Python dict."""
     raw = file.getvalue()
@@ -79,7 +78,7 @@ def _load_structured(file) -> dict:
         return json.loads(text)
     except Exception:
         pass
-    # Try YAML if available
+    # Try YAML
     if _HAS_YAML:
         try:
             return yaml.safe_load(text)
@@ -93,7 +92,8 @@ def _is_match_list(v) -> bool:
 
 
 def parse_scanoss_payload(payload: dict) -> pd.DataFrame:
-    """Flatten typical ScanOSS output into a DataFrame.
+    """
+    Flatten typical ScanOSS output into a DataFrame.
     Expected structure: top-level keys are file paths; values are lists of match dicts.
     """
     rows = []
@@ -116,8 +116,7 @@ def parse_scanoss_payload(payload: dict) -> pd.DataFrame:
 
             # licenses
             licenses = m.get("licenses") or []
-            lic_names = []
-            lic_sources = []
+            lic_names, lic_sources = [], []
             for lic in licenses:
                 if isinstance(lic, dict):
                     name = lic.get("name") or lic.get("license")
@@ -169,7 +168,8 @@ def parse_scanoss_payload(payload: dict) -> pd.DataFrame:
                 "Vendor": vendor or "—",
                 "Match %": matched or "—",
                 "Sources": "; ".join(sorted(sources)) if sources else "—",
-                "Health": (f"★ {int(stars)} / {int(forks)}" if (isinstance(stars, (int, float)) and isinstance(forks, (int, float))) else "—"),
+                "Health": (f"★ {int(stars)} / {int(forks)}"
+                           if (isinstance(stars, (int, float)) and isinstance(forks, (int, float))) else "—"),
                 "Release Date": release_date or "—",
                 "_HasDeps": has_deps,
                 "_LicList": lic_names,
@@ -200,10 +200,8 @@ def compute_kpis(df: pd.DataFrame) -> dict:
     }
 
 # Excel writer fallback: try openpyxl, then XlsxWriter
-
 def make_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
-    engine = None
     try:
         import openpyxl  # type: ignore
         engine = "openpyxl"
@@ -224,6 +222,7 @@ left, right = st.columns([2, 1])
 with left:
     st.title("OSS Compliance – JSON/YAML Dashboard")
     st.caption("Upload ScanOSS results, click **Scan / Process**, then export to Excel.")
+
 with right:
     with st.container(border=True):
         uploaded_file = st.file_uploader(
@@ -235,14 +234,14 @@ with right:
         )
         if uploaded_file is not None:
             prev_name = st.session_state.get("file_name")
-            # Only mark as a fresh upload if name changed or not previously uploaded
+            # Only mark as fresh upload if name changed or not previously uploaded
             if not st.session_state.get("uploaded") or uploaded_file.name != prev_name:
                 st.session_state["uploaded_file"] = uploaded_file
                 st.session_state["file_name"] = uploaded_file.name
                 st.session_state["uploaded"] = True
-                st.session_state["processed"] = False
+                st.session_state["processed"] = False  # reset only when a NEW file is chosen
 
-        # Buttons stacked vertically in the header
+        # Scan / Process
         process_disabled = not st.session_state["uploaded"]
         if st.button("🔎 Scan / Process", type="primary", disabled=process_disabled, help="Process the uploaded file"):
             try:
@@ -254,6 +253,7 @@ with right:
                 df = pd.DataFrame()
             else:
                 st.session_state["processed"] = True
+
             st.session_state["findings_df"] = df
             st.session_state["kpis"] = compute_kpis(df)
             # Freeze a stable copy for display until next Scan
@@ -262,29 +262,27 @@ with right:
             st.session_state["table_df"] = stable_df
             st.session_state["export_df"] = stable_df.copy()
 
+        # Export to Excel (uses frozen/filtered export_df)
         if st.session_state["processed"] and not st.session_state["findings_df"].empty:
             export_df = st.session_state.get("export_df", st.session_state["findings_df"]).copy()
             df_to_export = export_df.drop(columns=[c for c in ["_HasDeps", "_LicList"] if c in export_df.columns])
-            buf = io.BytesIO()
             try:
-            data_bytes = make_excel_bytes(df_to_export)
-            st.download_button(
-                label="📥 Export to Excel",
-                data=data_bytes,
-                file_name=f"oss_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="Download the current (filtered) table as Excel",
-            )
-        except RuntimeError as e:
-            st.error(str(e))
-            st.button("📥 Export to Excel", disabled=True),
-                file_name=f"oss_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="Download the current (filtered) table as Excel",
-            )
+                data_bytes = make_excel_bytes(df_to_export)
+            except RuntimeError as e:
+                st.error(str(e))
+                st.button("📥 Export to Excel", disabled=True)
+            else:
+                st.download_button(
+                    label="📥 Export to Excel",
+                    data=data_bytes,
+                    file_name=f"oss_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Download the current (filtered) table as Excel",
+                )
         else:
             st.button("📥 Export to Excel", disabled=True)
 
+        # Clear
         if st.button("🧹 Clear", help="Reset the dashboard"):
             reset_state()
             st.experimental_rerun()
@@ -321,12 +319,14 @@ else:
 if st.session_state["processed"] and not st.session_state["findings_df"].empty:
     df_base = st.session_state["findings_df"]
     lic_counts = {}
+    # Prefer helper list for accuracy
     for lst in df_base.get("_LicList", []):
         if isinstance(lst, list):
             for name in lst:
                 if not name:
                     continue
                 lic_counts[name] = lic_counts.get(name, 0) + 1
+    # Fallback: split the visible Licenses string
     if not lic_counts and not df_base.empty:
         for s in df_base["Licenses"].astype(str).tolist():
             for name in [x.strip() for x in s.split(",") if x.strip() and x.strip() != "—"]:
@@ -347,23 +347,18 @@ if st.session_state["processed"] and not st.session_state["findings_df"].empty:
         st.altair_chart(pie, use_container_width=True)
 
 # ---------------------------
-# Findings table (AG Grid with Excel-like header filters)
+# Findings (stable table + in-column filters)
 # ---------------------------
 with st.container(border=True):
     st.subheader("Findings")
 
+    # Only check the frozen table to decide visibility (prevents disappearing on reruns)
     has_table = st.session_state.get("table_df", pd.DataFrame()).shape[0] > 0
 
     if has_table:
-        # Always render the stable table created at Scan time
         df_show = st.session_state.get("table_df", pd.DataFrame()).copy()
-        if df_show.empty:
-            df_base = st.session_state["findings_df"].copy()
-            helper_cols = ["_HasDeps", "_LicList"]
-            df_show = df_base.drop(columns=[c for c in helper_cols if c in df_base.columns])
-
         if _HAS_AGGRID:
-            # Always show header icons (menu/filter) like Excel
+            # Keep header icons visible like Excel
             st.markdown(
                 """
                 <style>
@@ -380,7 +375,6 @@ with st.container(border=True):
                 sortable=True,
                 resizable=True,
             )
-            # Keep menu icons visible
             gb.configure_grid_options(suppressMenuHide=True)
 
             # Column-specific filter types
@@ -388,34 +382,29 @@ with st.container(border=True):
                 if pd.api.types.is_numeric_dtype(df_show[col]):
                     gb.configure_column(col, filter="agNumberColumnFilter")
                 else:
-                    # Use Set Filter only if enterprise is enabled; otherwise fallback to Text Filter
+                    # Set Filter only if Enterprise allowed, else Text Filter
                     if USE_SET_FILTER and col in ("Licenses", "HighestSeverity", "Vendor", "Sources"):
                         gb.configure_column(col, filter="agSetColumnFilter")
                     else:
                         gb.configure_column(col, filter="agTextColumnFilter")
 
             grid_options = gb.build()
-            # Funnel icon glyph for menu/filter
+            # Funnel glyph for menu/filter icons
             funnel_svg = '<svg width="12" height="12" viewBox="0 0 24 24"><path d="M3 5h18l-7 7v7l-4-2v-5z" fill="currentColor"/></svg>'
-            grid_options["icons"] = {
-                "menu": funnel_svg,
-                "filter": funnel_svg,
-                "filterActive": funnel_svg,
-            }
+            grid_options["icons"] = {"menu": funnel_svg, "filter": funnel_svg, "filterActive": funnel_svg}
 
             grid_resp = AgGrid(
                 df_show,
                 gridOptions=grid_options,
                 theme="streamlit",
-                update_mode=GridUpdateMode.NO_UPDATE,
+                update_mode=GridUpdateMode.NO_UPDATE,             # no reruns on keystrokes
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
                 allow_unsafe_jscode=True,
                 height=480,
-                key="findings_grid",
+                key="findings_grid",                              # stable identity
             )
 
-            # To avoid full-page reruns on each keystroke, we don't update on every model change.
-            # Click the button below to sync the filtered table into Export.
+            # Manual sync for export on demand
             if st.button("🔄 Sync Export from Table"):
                 resp_data = grid_resp.get("data")
                 if isinstance(resp_data, pd.DataFrame) and not resp_data.empty:
@@ -428,12 +417,12 @@ with st.container(border=True):
                         st.session_state["export_df"] = df_show.copy()
                 st.success("Export view updated from current table filters.")
         else:
-            st.warning("In-table column filters require 'streamlit-aggrid'. Showing a basic table instead. Install with: pip install streamlit-aggrid")
+            st.warning("In-table column filters require 'streamlit-aggrid'. Showing a basic table instead.")
             st.dataframe(df_show, use_container_width=True)
-            st.session_state["export_df"] = df_show
+            st.session_state["export_df"] = df_show.copy()
 
-        st.caption(f"Rows: {len(st.session_state['export_df'])}")
-    elif st.session_state["processed"] and st.session_state["findings_df"].empty:
+        st.caption(f"Rows: {len(st.session_state.get('export_df', df_show))}")
+    elif st.session_state["processed"]:
         st.warning("Parsed successfully but no match rows found.")
     else:
         st.info("No rows yet. Upload a file and click **Scan / Process**.")
